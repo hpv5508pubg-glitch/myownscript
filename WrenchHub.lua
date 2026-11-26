@@ -7892,7 +7892,7 @@ function build.modOverlay()
 		Name = 'Position Y',
 		Min = 0,
 		Max = 1000,
-		Default = 0,
+		Default = 104,
 		Suffix = 'px',
 		Function = movedList,
 		Tooltip = 'How far down from the top of the screen the list sits'
@@ -8014,7 +8014,7 @@ function build.modOverlay()
 	})
 	Watermark = TextGUI:CreateToggle({
 		Name = 'Watermark',
-		Default = true,
+		Default = false,
 		Tooltip = 'Shows the Pistonware logo above the list',
 		Function = function(callback)
 			if WatermarkStyle then
@@ -8152,13 +8152,23 @@ function build.modOverlay()
 				background.Enabled = true
 				moved = true
 			end
+			local wm = options.Watermark
+			if type(wm) == 'table' and wm.Enabled ~= false then
+				wm.Enabled = false
+				moved = true
+			end
+			local py = options['Position Y']
+			if type(py) == 'table' and (tonumber(py.Value) or 0) < 40 then
+				py.Value = 104
+				moved = true
+			end
 			return moved
 		end
 
 		local loadOverlay, saveOverlay = TextGUI.Load, TextGUI.Save
 		function TextGUI:Load(data)
 			-- The saved table is this load's own copy, just read off disk: upgraded, then applied.
-			if type(data) == 'table' and type(data.Options) == 'table' and (tonumber(data.DefaultsVersion) or 1) < 4
+			if type(data) == 'table' and type(data.Options) == 'table' and (tonumber(data.DefaultsVersion) or 1) < 5
 				and upgrade(data.Options) then
 				vape.UpgradeGeneration = vape.LoadGeneration
 			end
@@ -8167,7 +8177,7 @@ function build.modOverlay()
 		function TextGUI:Save(data)
 			saveOverlay(self, data)
 			if type(data['Text GUI']) == 'table' then
-				data['Text GUI'].DefaultsVersion = 4
+				data['Text GUI'].DefaultsVersion = 5
 			end
 		end
 	end
@@ -8964,6 +8974,10 @@ function build.targetInfo()
 		end
 	})
 
+	local TargetScale = ui.new('UIScale', {
+		Name = 'TargetScale',
+		Scale = 1.35
+	}, TargetInfoOverlay.Children)
 	local Holder = ui.new('Frame', {
 		BackgroundColor3 = CARD.Window,
 		BackgroundTransparency = BackgroundTransparency.Value,
@@ -9243,6 +9257,17 @@ function build.targetInfo()
 		Name = 'Font',
 		Default = 'Inter',
 		Function = function() end
+	})
+	TargetInfoOverlay:CreateSlider({
+		Name = 'Scale',
+		Min = 0.8,
+		Max = 2,
+		Default = 1.35,
+		Decimal = 20,
+		Function = function(val)
+			TargetScale.Scale = val
+		end,
+		Tooltip = 'Scales the Target Info card size.'
 	})
 	DisplayName = TargetInfoOverlay:CreateToggle({
 		Name = 'Use Displayname',
@@ -18652,9 +18677,22 @@ local SHOP_KEYWORDS = {
 
 local blockedCache = setmetatable({}, { __mode = "k" })
 local function isPetrifiedStatue(model)
-    if model:GetAttribute("PetrifyId") ~= nil then return true end
-    local okTag, tagged = pcall(function() return CollectionService:HasTag(model, "petrified-player") end)
-    if okTag and tagged then return true end
+    local curInst = model
+    while curInst and curInst ~= workspace do
+        if curInst:GetAttribute("PetrifyId") ~= nil then return true end
+        local okTag, tagged = pcall(function() return CollectionService:HasTag(curInst, "petrified-player") end)
+        if okTag and tagged then return true end
+        local nl = curInst.Name:lower()
+        if nl:find("petrif", 1, true) then return true end
+        curInst = curInst.Parent
+    end
+    for _, ch in ipairs(model:GetChildren()) do
+        if ch:GetAttribute("PetrifyId") ~= nil then return true end
+    end
+    local par = model.Parent
+    if par and par ~= workspace and par:IsA("Model") and par:FindFirstChildWhichIsA("ProximityPrompt", true) then
+        return true
+    end
     return false
 end
 
@@ -18688,6 +18726,23 @@ local function isBlockedModel(model)
     return blocked
 end
 
+local function markStatueSubtree(inst)
+    if not inst then return end
+    blockedCache[inst] = true
+    local mdl = inst:IsA("Model") and inst or inst:FindFirstAncestorOfClass("Model")
+    if mdl then
+        blockedCache[mdl] = true
+        local h = mdl:FindFirstChildOfClass("Humanoid")
+        if h then npcRegistry[h] = nil end
+    end
+    for _, sub in ipairs(inst:GetDescendants()) do
+        if sub:IsA("Humanoid") then
+            npcRegistry[sub] = nil
+            if sub.Parent then blockedCache[sub.Parent] = true end
+        end
+    end
+end
+
 local function registerNpc(model, kind)
     if not model or not model:IsA("Model") or Players:GetPlayerFromCharacter(model) then return end
     if isBlockedModel(model) then return end
@@ -18703,9 +18758,7 @@ local function trackWorkspaceEntity(inst)
     if inst:IsA("ProximityPrompt") then
         local mdl = inst:FindFirstAncestorOfClass("Model")
         if mdl and not Players:GetPlayerFromCharacter(mdl) then
-            blockedCache[mdl] = true
-            local h = mdl:FindFirstChildOfClass("Humanoid")
-            if h then npcRegistry[h] = nil end
+            markStatueSubtree(mdl)
         end
         return
     end
@@ -18722,15 +18775,9 @@ for _, d in ipairs(workspace:GetDescendants()) do trackWorkspaceEntity(d) end
 CoreMaid:give(workspace.DescendantAdded:Connect(trackWorkspaceEntity))
 CoreMaid:give(workspace.DescendantRemoving:Connect(function(d) npcRegistry[d] = nil end))
 for _, inst in ipairs(CollectionService:GetTagged("petrified-player")) do
-    blockedCache[inst] = true
-    local h = inst:FindFirstChildOfClass("Humanoid")
-    if h then npcRegistry[h] = nil end
+    markStatueSubtree(inst)
 end
-CoreMaid:give(CollectionService:GetInstanceAddedSignal("petrified-player"):Connect(function(inst)
-    blockedCache[inst] = true
-    local h = inst:FindFirstChildOfClass("Humanoid")
-    if h then npcRegistry[h] = nil end
-end))
+CoreMaid:give(CollectionService:GetInstanceAddedSignal("petrified-player"):Connect(markStatueSubtree))
 
 local BEDWARS_TAGS = { "Monster", "DiamondGuardian", "GolemBoss", "Drone", "Mob", "NPC", "Enemy", "monster", "mob", "npc", "enemy" }
 for _, tag in ipairs(BEDWARS_TAGS) do
@@ -18792,13 +18839,18 @@ function Entities.rebuild()
 
     for hum, kind in pairs(npcRegistry) do
         local model = hum.Parent
-        if model and hum.Health > 0 and not isBlockedModel(model) then
-            local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("Head")
-            if root then
-                local npcTeam = model:GetAttribute("Team")
-                local ownerId = tonumber(model:GetAttribute("PlayerUserId"))
-                local friendly = checkTeams and ((myTeamAttr ~= nil and npcTeam == myTeamAttr) or (ownerId == LP.UserId))
-                push(model, hum, root, model.Name, nil, Color3.fromRGB(190, 190, 205), friendly, true, kind == "npc")
+        if not model or isBlockedModel(model) then
+            npcRegistry[hum] = nil
+        elseif hum.Health > 0 then
+            local okDead, dead = pcall(function() return hum:GetState() == Enum.HumanoidStateType.Dead end)
+            if not (okDead and dead) then
+                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("Head")
+                if root then
+                    local npcTeam = model:GetAttribute("Team")
+                    local ownerId = tonumber(model:GetAttribute("PlayerUserId"))
+                    local friendly = checkTeams and ((myTeamAttr ~= nil and npcTeam == myTeamAttr) or (ownerId == LP.UserId))
+                    push(model, hum, root, model.Name, nil, Color3.fromRGB(190, 190, 205), friendly, true, kind == "npc")
+                end
             end
         end
     end
@@ -20478,18 +20530,22 @@ do
 
         if cur then
             local e = Entities.byModel[cur.model]
-            if e then
-                getTiEntry(e)
-            elseif cur.hum then
-                cur.entry.Health = math.max(cur.hum.Health, 0)
-            end
-            if cur.hum.Health <= 0 and not cur.deadAt then
-                cur.deadAt = now
-                cur.expiry = now + 1.2
-            end
-            local maxDist = cur.soft and (aRange * 1.2) or (fRange * 1.5)
-            if (not e and not cur.deadAt) or now > cur.expiry or (e and e.dist > maxDist) then
+            if isBlockedModel(cur.model) then
                 cur = nil
+            else
+                if e then
+                    getTiEntry(e)
+                elseif cur.hum then
+                    cur.entry.Health = math.max(cur.hum.Health, 0)
+                end
+                if cur.hum.Health <= 0 and not cur.deadAt then
+                    cur.deadAt = now
+                    cur.expiry = now + 1.2
+                end
+                local maxDist = cur.soft and (aRange * 1.2) or (fRange * 1.5)
+                if (not e and not cur.deadAt) or now > cur.expiry or (e and e.dist > maxDist) then
+                    cur = nil
+                end
             end
         end
 
@@ -20758,12 +20814,12 @@ end
 --------------------------------------------------------------------------------
 local StatsOverlay
 do
-    local FpsOpt, PingOpt, MemOpt, TransOpt
-    local cardFrame, statsLabel
+    local FpsOpt, PingOpt, MemOpt, TransOpt, ScaleOpt
+    local cardFrame, statsLabel, statsScale
     StatsOverlay = vape:CreateOverlay({
         Name = "Stats",
         Tooltip = "Displays FPS, Ping, and Memory usage.",
-        CategorySize = 156,
+        CategorySize = 190,
         Function = function(callback)
             if not callback then return end
             local frames, acc = 0, 0
@@ -20785,28 +20841,42 @@ do
                 if statsLabel then
                     statsLabel.Text = #lines > 0 and table.concat(lines, "\n") or "No stats"
                     if cardFrame then
-                        cardFrame.Size = UDim2.fromOffset(156, math.max(#lines, 1) * 16 + 14)
+                        cardFrame.Size = UDim2.fromOffset(190, math.max(#lines, 1) * 20 + 16)
                     end
                 end
             end))
         end,
     })
+    statsScale = Instance.new("UIScale")
+    statsScale.Name = "StatsScale"
+    statsScale.Scale = 1.3
+    statsScale.Parent = StatsOverlay.Children
     cardFrame = make("Frame", {
         Active = true,
         BackgroundColor3 = T.cardBg,
         BackgroundTransparency = 0.15,
         BorderSizePixel = 0,
-        Size = UDim2.fromOffset(156, 62),
+        Size = UDim2.fromOffset(190, 76),
     }, StatsOverlay.Children)
     corner(cardFrame, 12)
     make("UIStroke", { Color = T.white, Thickness = 1, Transparency = 0.9 }, cardFrame)
-    statsLabel = textLabel(cardFrame, "FPS  --\nPING --\nMEM  --", 13, Color3.fromRGB(240, 240, 240), Left, UDim2.fromOffset(10, 7), UDim2.new(1, -20, 1, -14))
+    statsLabel = textLabel(cardFrame, "FPS   --\nPING  --\nMEM   --", 16, Color3.fromRGB(240, 240, 240), Left, UDim2.fromOffset(12, 8), UDim2.new(1, -24, 1, -16))
     statsLabel.TextYAlignment = Enum.TextYAlignment.Top
     statsLabel.TextTruncate = Enum.TextTruncate.None
 
     FpsOpt = StatsOverlay:CreateToggle({ Name = "FPS", Default = true })
     PingOpt = StatsOverlay:CreateToggle({ Name = "Ping", Default = true })
     MemOpt = StatsOverlay:CreateToggle({ Name = "Memory", Default = true })
+    ScaleOpt = StatsOverlay:CreateSlider({
+        Name = "Scale",
+        Min = 0.8,
+        Max = 2,
+        Default = 1.3,
+        Decimal = 20,
+        Function = function(val)
+            if statsScale then statsScale.Scale = val end
+        end,
+    })
     TransOpt = StatsOverlay:CreateSlider({
         Name = "Transparency",
         Min = 0,
@@ -20821,19 +20891,19 @@ end
 
 local KeystrokesOverlay
 do
-    local StyleOpt, SpaceOpt
+    local StyleOpt, SpaceOpt, ScaleOpt
     local KeyDefs = {
-        { Enum.KeyCode.W, "W", "↑", 38, 0, 34, 34 },
-        { Enum.KeyCode.A, "A", "←", 0, 38, 34, 34 },
-        { Enum.KeyCode.S, "S", "↓", 38, 38, 34, 34 },
-        { Enum.KeyCode.D, "D", "→", 76, 38, 34, 34 },
-        { Enum.KeyCode.Space, "SPACE", "SPACE", 0, 76, 110, 24 },
+        { Enum.KeyCode.W, "W", "↑", 48, 0, 44, 44 },
+        { Enum.KeyCode.A, "A", "←", 0, 48, 44, 44 },
+        { Enum.KeyCode.S, "S", "↓", 48, 48, 44, 44 },
+        { Enum.KeyCode.D, "D", "→", 96, 48, 44, 44 },
+        { Enum.KeyCode.Space, "SPACE", "SPACE", 0, 96, 140, 32 },
     }
     local keyBoxes = {}
     KeystrokesOverlay = vape:CreateOverlay({
         Name = "Keystrokes",
         Tooltip = "Shows WASD and Spacebar key presses on screen.",
-        CategorySize = 110,
+        CategorySize = 140,
         Function = function(callback)
             if not callback then return end
             local anims, prev = {}, {}
@@ -20856,11 +20926,15 @@ do
             end))
         end,
     })
+    local keyScale = Instance.new("UIScale")
+    keyScale.Name = "KeystrokesScale"
+    keyScale.Scale = 1.35
+    keyScale.Parent = KeystrokesOverlay.Children
     local holder = make("Frame", {
         Active = true,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Size = UDim2.fromOffset(110, 100),
+        Size = UDim2.fromOffset(140, 128),
     }, KeystrokesOverlay.Children)
     for i, d in ipairs(KeyDefs) do
         local f = make("Frame", {
@@ -20870,9 +20944,9 @@ do
             BackgroundTransparency = 0.15,
             BorderSizePixel = 0,
         }, holder)
-        corner(f, 8)
+        corner(f, 9)
         make("UIStroke", { Color = T.white, Thickness = 1, Transparency = 0.9 }, f)
-        local lbl = textLabel(f, d[2], 13, Color3.fromRGB(240, 240, 240), Center)
+        local lbl = textLabel(f, d[2], 16, Color3.fromRGB(240, 240, 240), Center)
         keyBoxes[i] = { frame = f, label = lbl }
     end
     StyleOpt = KeystrokesOverlay:CreateDropdown({
@@ -20885,12 +20959,22 @@ do
             end
         end,
     })
+    ScaleOpt = KeystrokesOverlay:CreateSlider({
+        Name = "Scale",
+        Min = 0.8,
+        Max = 2,
+        Default = 1.35,
+        Decimal = 20,
+        Function = function(val)
+            if keyScale then keyScale.Scale = val end
+        end,
+    })
     SpaceOpt = KeystrokesOverlay:CreateToggle({
         Name = "Show Spacebar",
         Default = true,
         Function = function(val)
             keyBoxes[5].frame.Visible = val
-            holder.Size = UDim2.fromOffset(110, val and 100 or 72)
+            holder.Size = UDim2.fromOffset(140, val and 128 or 92)
         end,
     })
 end
