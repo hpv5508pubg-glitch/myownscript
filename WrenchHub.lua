@@ -19592,7 +19592,7 @@ do
             return
         end
         if not (setInvRemote and setInvRemote.Parent) then
-            setInvRemote = findRemote(('rbxts_include', 'node_modules', '@rbxts', 'net', 'out', '_NetManaged', 'SetInvItem'), "SetInvItem")
+            setInvRemote = findRemote({ "rbxts_include", "node_modules", "@rbxts", "net", "out", "_NetManaged", "SetInvItem" }, "SetInvItem")
         end
         if setInvRemote then
             if setInvRemote:IsA("RemoteFunction") then
