@@ -18651,10 +18651,21 @@ local SHOP_KEYWORDS = {
 }
 
 local blockedCache = setmetatable({}, { __mode = "k" })
+local function isPetrifiedStatue(model)
+    if model:GetAttribute("PetrifyId") ~= nil then return true end
+    local okTag, tagged = pcall(function() return CollectionService:HasTag(model, "petrified-player") end)
+    if okTag and tagged then return true end
+    return false
+end
+
 local function isBlockedModel(model)
     if not model or not model:IsA("Model") then return true end
     local myChar = LP.Character
     if myChar and (model == myChar or model:IsDescendantOf(myChar)) then return true end
+    if isPetrifiedStatue(model) then
+        blockedCache[model] = true
+        return true
+    end
     local cached = blockedCache[model]
     if cached ~= nil then return cached end
     local blocked = false
@@ -18682,25 +18693,44 @@ local function registerNpc(model, kind)
     if isBlockedModel(model) then return end
     task.spawn(function()
         local h = model:FindFirstChildOfClass("Humanoid") or model:WaitForChild("Humanoid", 2)
-        if h and h:IsA("Humanoid") and not npcRegistry[h] then
+        if h and h:IsA("Humanoid") and not npcRegistry[h] and not isBlockedModel(model) then
             npcRegistry[h] = kind
         end
     end)
 end
 
-local function trackDummy(h)
-    if not h:IsA("Humanoid") then return end
-    local model = h.Parent
+local function trackWorkspaceEntity(inst)
+    if inst:IsA("ProximityPrompt") then
+        local mdl = inst:FindFirstAncestorOfClass("Model")
+        if mdl and not Players:GetPlayerFromCharacter(mdl) then
+            blockedCache[mdl] = true
+            local h = mdl:FindFirstChildOfClass("Humanoid")
+            if h then npcRegistry[h] = nil end
+        end
+        return
+    end
+    if not inst:IsA("Humanoid") then return end
+    local model = inst.Parent
     if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) and not isBlockedModel(model) then
         if model.Name:lower():find("dummy", 1, true) then
-            npcRegistry[h] = "dummy"
+            npcRegistry[inst] = "dummy"
         end
     end
 end
 
-for _, d in ipairs(workspace:GetDescendants()) do trackDummy(d) end
-CoreMaid:give(workspace.DescendantAdded:Connect(trackDummy))
+for _, d in ipairs(workspace:GetDescendants()) do trackWorkspaceEntity(d) end
+CoreMaid:give(workspace.DescendantAdded:Connect(trackWorkspaceEntity))
 CoreMaid:give(workspace.DescendantRemoving:Connect(function(d) npcRegistry[d] = nil end))
+for _, inst in ipairs(CollectionService:GetTagged("petrified-player")) do
+    blockedCache[inst] = true
+    local h = inst:FindFirstChildOfClass("Humanoid")
+    if h then npcRegistry[h] = nil end
+end
+CoreMaid:give(CollectionService:GetInstanceAddedSignal("petrified-player"):Connect(function(inst)
+    blockedCache[inst] = true
+    local h = inst:FindFirstChildOfClass("Humanoid")
+    if h then npcRegistry[h] = nil end
+end))
 
 local BEDWARS_TAGS = { "Monster", "DiamondGuardian", "GolemBoss", "Drone", "Mob", "NPC", "Enemy", "monster", "mob", "npc", "enemy" }
 for _, tag in ipairs(BEDWARS_TAGS) do
@@ -19496,12 +19526,45 @@ end
 -- COMBAT : Kill Aura
 --------------------------------------------------------------------------------
 do
-    local AttackRange, SwingRange, DelayOpt, FOVOpt, MaxTargets
+    local AttackRange, SwingRange, AutoCooldown, DelayOpt, FOVOpt, MaxTargets
     local PriorityOpt, TargetsOpt, AutoEquip, SwingAnim, FaceTarget
+    local setInvRemote
+    local function equipBedwarsSword(itemObj)
+        if not itemObj then return end
+        local ch = LP.Character
+        if not ch then return end
+        local hv = ch:FindFirstChild(Config.Resolver.HandValueName)
+        if hv and hv:IsA("ObjectValue") and hv.Value == itemObj then return end
+        if itemObj:IsA("Tool") then
+            equipToolIfNeeded(itemObj)
+            return
+        end
+        if not (setInvRemote and setInvRemote.Parent) then
+            setInvRemote = findRemote(('rbxts_include', 'node_modules', '@rbxts', 'net', 'out', '_NetManaged', 'SetInvItem'), "SetInvItem")
+        end
+        if setInvRemote then
+            if setInvRemote:IsA("RemoteFunction") then
+                task.spawn(function() pcall(function() setInvRemote:InvokeServer({ hand = itemObj }) end) end)
+            else
+                pcall(function() setInvRemote:FireServer({ hand = itemObj }) end)
+            end
+        end
+    end
+    local function getSwordDelay(sword)
+        if not AutoCooldown.Enabled then
+            return DelayOpt.Value
+        end
+        local nm = sword and sword.Name and sword.Name:lower() or ""
+        if nm:find("rageblade", 1, true) then
+            return math.max(0.25, DelayOpt.Value)
+        end
+        return math.max(0.31, DelayOpt.Value)
+    end
+
     local KillAura
     KillAura = vape.Categories.Combat:CreateModule({
         Name = "Kill Aura",
-        Tooltip = "Attacks nearby enemies within range automatically (external packet, no mouse1click).",
+        Tooltip = "Attacks nearby enemies within 360 range cleanly (syncs sword cooldown & raycast).",
         ExtraText = function() return PriorityOpt and PriorityOpt.Value or "Distance" end,
         Function = function(callback)
             if not callback then return end
@@ -19515,7 +19578,7 @@ do
             maid:give(Entities.acquire())
             local rp = RaycastParams.new()
             rp.FilterType = Enum.RaycastFilterType.Exclude
-            local last = 0
+            local last, cycleIdx = 0, 0
             local swingAnimObj = maid:give(Instance.new("Animation"))
             swingAnimObj.AnimationId = "rbxassetid://4947108314"
             local cachedHum, cachedTrack = nil, nil
@@ -19544,7 +19607,8 @@ do
                 local lookFlat = root.CFrame.LookVector * Vector3.new(1, 0, 1)
                 if lookFlat.Magnitude > 1e-3 then lookFlat = lookFlat.Unit end
 
-                local playerPool, npcPool = {}, {}
+                local atkPlayers, atkNpcs = {}, {}
+                local swPlayers, swNpcs = {}, {}
                 local rangeVal, swingVal = AttackRange.Value, SwingRange.Value
                 local fovVal = FOVOpt.Value
                 local wantPlayers = TargetsOpt.Players.Enabled
@@ -19559,7 +19623,7 @@ do
                         local okType = (not e.isDummy and wantPlayers) or (e.isDummy and wantNpcs)
                         if okType then
                             local passFov = true
-                            if fovVal < 360 then
+                            if fovVal < 359 then
                                 local flat = (e.root.Position - spos) * Vector3.new(1, 0, 1)
                                 if flat.Magnitude > 0.1 then
                                     local ang = math.deg(math.acos(math.clamp(lookFlat:Dot(flat.Unit), -1, 1)))
@@ -19572,80 +19636,97 @@ do
                                 passWall = workspace:Raycast(spos, e.root.Position - spos, rp) == nil
                             end
                             if passFov and passWall then
-                                if not e.isDummy then playerPool[#playerPool + 1] = e else npcPool[#npcPool + 1] = e end
+                                if e.dist <= rangeVal then
+                                    if not e.isDummy then atkPlayers[#atkPlayers + 1] = e else atkNpcs[#atkNpcs + 1] = e end
+                                end
+                                if not e.isDummy then swPlayers[#swPlayers + 1] = e else swNpcs[#swNpcs + 1] = e end
                             end
                         end
                     end
                 end
 
-                local pool = (#playerPool > 0) and playerPool or npcPool
-                if #pool == 0 then return end
-                if PriorityOpt.Value == "Health" then
-                    table.sort(pool, function(a, b) return a.hum.Health < b.hum.Health end)
+                local atkPool = (#atkPlayers > 0) and atkPlayers or atkNpcs
+                local swPool = (#swPlayers > 0) and swPlayers or swNpcs
+                if #atkPool == 0 and #swPool == 0 then return end
+
+                local prio = PriorityOpt.Value
+                if prio == "Health" then
+                    if #atkPool > 1 then table.sort(atkPool, function(a, b) return a.hum.Health < b.hum.Health end) end
+                    if #swPool > 1 then table.sort(swPool, function(a, b) return a.hum.Health < b.hum.Health end) end
                 end
 
-                local primary = pool[1]
-                Targeting.report(primary, "KillAura")
+                local preview = atkPool[1] or swPool[1]
+                if preview then
+                    Targeting.report(preview, "KillAura")
+                end
+                if #atkPool == 0 then return end
 
-                local now = os.clock()
-                if now - last < DelayOpt.Value then return end
                 local sword = pickSword()
                 local remote = getAttackRemote()
                 if not sword or not remote then return end
-                if AutoEquip.Enabled then equipToolIfNeeded(sword) end
+                local cooldown = getSwordDelay(sword)
+                local now = os.clock()
+                if now - last < cooldown then return end
+
+                if AutoEquip.Enabled then equipBedwarsSword(sword) end
+
+                local maxT = math.max(1, math.min(#atkPool, MaxTargets.Value))
+                local chosenIdx = 1
+                if prio == "Switch" or maxT > 1 then
+                    cycleIdx = (cycleIdx % maxT) + 1
+                    chosenIdx = cycleIdx
+                end
+                local target = atkPool[chosenIdx] or atkPool[1]
+                Targeting.report(target, "KillAura")
+
+                local targetPartPos = target.root.Position
+                if FaceTarget.Enabled then
+                    root.CFrame = CFrame.lookAt(spos, Vector3.new(targetPartPos.X, spos.Y, targetPartPos.Z))
+                end
+
+                local dirVec = targetPartPos - spos
+                local mag = dirVec.Magnitude
+                if mag < 0.01 then return end
+                local unitDir = dirVec / mag
+                local spoofSelf = (mag > 14.4) and (spos + unitDir * math.min(mag - 14.0, 6.0)) or spos
+                local rayCam = spos + unitDir * math.min(mag, 18)
+                local rayDir = (rayCam - spoofSelf).Magnitude >= 0.05 and CFrame.lookAt(spoofSelf, rayCam).LookVector or unitDir
+                local pivotPos = (target.model and target.model:GetPivot().Position) or targetPartPos
+
+                local packet = {
+                    entityInstance = target.model,
+                    chargedAttack = { chargeRatio = 0 },
+                    validate = {
+                        targetPosition = { value = pivotPos },
+                        selfPosition = { value = spoofSelf },
+                        raycast = {
+                            cameraPosition = { value = rayCam },
+                            cursorDirection = { value = rayDir },
+                        },
+                    },
+                    weapon = sword,
+                }
 
                 last = now
-                if FaceTarget.Enabled then
-                    local tp = primary.root.Position
-                    root.CFrame = CFrame.lookAt(spos, Vector3.new(tp.X, spos.Y, tp.Z))
+                if remote:IsA("RemoteFunction") then
+                    task.spawn(function() pcall(function() remote:InvokeServer(packet) end) end)
+                else
+                    pcall(function() remote:FireServer(packet) end)
                 end
-
-                local hits = 0
-                for i = 1, math.min(#pool, MaxTargets.Value) do
-                    local t = pool[i]
-                    if t.dist <= rangeVal then
-                        local tpos = t.root.Position
-                        local dir = tpos - spos
-                        if dir.Magnitude >= 0.01 then
-                            local validSelf = (dir.Magnitude > 13.5) and (tpos - dir.Unit * 13.5) or spos
-                            local camPos = c.CFrame.Position
-                            local camDir = tpos - camPos
-                            camDir = (camDir.Magnitude >= 0.01) and camDir.Unit or dir.Unit
-                            local packet = {
-                                entityInstance = t.model,
-                                chargedAttack = { chargeRatio = 0 },
-                                validate = {
-                                    targetPosition = { value = tpos },
-                                    selfPosition = { value = validSelf },
-                                    raycast = {
-                                        cameraPosition = { value = camPos },
-                                        cursorDirection = { value = camDir },
-                                    },
-                                },
-                                weapon = sword,
-                            }
-                            if remote:IsA("RemoteFunction") then
-                                task.spawn(function() pcall(function() remote:InvokeServer(packet) end) end)
-                            else
-                                pcall(function() remote:FireServer(packet) end)
-                            end
-                            hits += 1
-                        end
-                    end
-                end
-                if hits > 0 and SwingAnim.Enabled then
+                if SwingAnim.Enabled then
                     playSwing(hum)
                 end
             end))
         end,
     })
     TargetsOpt = KillAura:CreateTargets({ Players = true, NPCs = true })
-    PriorityOpt = KillAura:CreateDropdown({ Name = "Target Priority", List = { "Distance", "Health" } })
-    AttackRange = KillAura:CreateSlider({ Name = "Attack range", Min = 6, Max = 30, Default = 20, Decimal = 10 })
-    SwingRange = KillAura:CreateSlider({ Name = "Swing range", Min = 6, Max = 35, Default = 22, Decimal = 10 })
+    PriorityOpt = KillAura:CreateDropdown({ Name = "Target Priority", List = { "Distance", "Health", "Switch" } })
+    AttackRange = KillAura:CreateSlider({ Name = "Attack range", Min = 6, Max = 20, Default = 18, Decimal = 10 })
+    SwingRange = KillAura:CreateSlider({ Name = "Swing range", Min = 6, Max = 22, Default = 20, Decimal = 10 })
+    AutoCooldown = KillAura:CreateToggle({ Name = "Auto cooldown", Default = true, Tooltip = "Matches BedWars 0.3s sword cooldown (0.25s rageblade) so the server accepts every swing." })
     DelayOpt = KillAura:CreateSlider({ Name = "Delay", Min = 0.05, Max = 0.5, Default = Config.Combat.DefaultAttackDelay, Decimal = 100, Suffix = "s" })
     FOVOpt = KillAura:CreateSlider({ Name = "FOV", Min = 30, Max = 360, Default = 360, Decimal = 1 })
-    MaxTargets = KillAura:CreateSlider({ Name = "Max targets", Min = 1, Max = 5, Default = 1, Decimal = 1 })
+    MaxTargets = KillAura:CreateSlider({ Name = "Max targets", Min = 1, Max = 5, Default = 3, Decimal = 1 })
     AutoEquip = KillAura:CreateToggle({ Name = "Auto equip", Default = false })
     SwingAnim = KillAura:CreateToggle({ Name = "3rd person swing", Default = true })
     FaceTarget = KillAura:CreateToggle({ Name = "Face target", Default = false })
